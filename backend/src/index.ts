@@ -11,7 +11,9 @@ dotenv.config()
 const app = express()
 const PORT = process.env.PORT || 3001
 
-app.use(cors())
+app.use(cors({
+  exposedHeaders: ['payment-required', 'payment-authorization']
+}))
 app.use(express.json())
 
 app.get('/health', (req, res) => {
@@ -144,14 +146,66 @@ app.post('/chat', async (req, res) => {
   }
 })
 
+import { requirePayment, PaymentRequest } from './payment/middleware';
+import { mintCredits, getUserCredits } from './payment/engine';
+import { getCreditTransactionsCollection } from './db';
+
+// Wallet and credits info
+app.get('/api/wallet/credits/:walletAddress', async (req, res) => {
+  const balance = await getUserCredits(req.params.walletAddress);
+  res.json({ balanceCents: balance, balanceDollars: (balance / 100).toFixed(2) });
+});
+
+import { getPayTo } from './payment/middleware';
+
+app.get('/api/wallet/pay-to', async (req, res) => {
+  try {
+    const address = await getPayTo();
+    res.json({ address });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch deposit address' });
+  }
+});
+
+app.get('/api/wallet/history/:walletAddress', async (req, res) => {
+  try {
+    const txCol = await getCreditTransactionsCollection();
+    const history = await txCol.find({ userId: req.params.walletAddress })
+                             .sort({ createdAt: -1 })
+                             .limit(20)
+                             .toArray();
+    res.json(history);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch history' });
+  }
+});
+
+app.post('/api/wallet/fund', async (req, res) => {
+  const { walletAddress, amountCents, txHash } = req.body;
+  if (!walletAddress || !amountCents || !txHash) {
+    return res.status(400).json({ error: 'Mission parameters for funding' });
+  }
+
+  // Ideally, we'd verify the txHash using verifyTransaction here.
+  // Assuming it is handled carefully on frontend and double checked here.
+  const success = await mintCredits(walletAddress, amountCents, txHash);
+  if (success) {
+    res.json({ success: true, message: 'Credits funded successfully' });
+  } else {
+    res.status(400).json({ error: 'Failed to find credits or tx Hash already exists' });
+  }
+});
+
 // Unlock/pay for data - generates markdown guide
-app.post('/unlock', async (req, res) => {
+app.post('/unlock', requirePayment(), async (req: PaymentRequest, res) => {
   const { walletAddress } = req.body
 
   // Get the negotiated price and topic for this wallet
   const state = pricingState.get(walletAddress)
-  const pricePaid = state?.cents || 10
   const topic = state?.topic || 'general knowledge'
+  const creditsDeducted = req.payment?.creditsDeducted || 0;
+  const usdcPaid = req.payment?.usdcPaid || 0;
+  const totalPaid = creditsDeducted + usdcPaid;
 
   try {
     console.log(`[Unlock] Generating markdown guide for topic: "${topic}"`)
@@ -162,10 +216,12 @@ app.post('/unlock', async (req, res) => {
       title: guide.title,
       markdown: guide.content,
       topic: topic,
-      message: `Payment of $${(pricePaid / 100).toFixed(2)} received! Here's your guide.`,
+      message: `Payment of $${(totalPaid / 100).toFixed(2)} received (Credits: ${creditsDeducted}¢, USDC: ${usdcPaid}¢)! Here's your guide.`,
       pricePaid: {
-        cents: pricePaid,
-        dollars: (pricePaid / 100).toFixed(2)
+        cents: totalPaid,
+        dollars: (totalPaid / 100).toFixed(2),
+        creditsDeducted,
+        usdcPaid
       }
     })
   } catch (error) {

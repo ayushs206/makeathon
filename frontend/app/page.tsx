@@ -3,8 +3,8 @@
 import { usePrivy, useWallets } from '@privy-io/react-auth'
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { generateZKProof, verifyZKProof, ProofData } from '@/lib/zkproof'
-import { sendChatStream, unlockData, getCurrentPrice as fetchPriceFromBackend } from '@/lib/api'
-import { makePaymentRequest } from '@/lib/x402client'
+import { sendChatStream, unlockData, getCurrentPrice as fetchPriceFromBackend, storeZkProof } from '@/lib/api'
+import { makePaymentRequest, createX402Fetch } from '@/lib/x402client'
 import { getBalances, Balances, FAUCETS } from '@/lib/balance'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -45,9 +45,18 @@ export default function Home() {
   const [showGuideModal, setShowGuideModal] = useState(false)
   const [guideContent, setGuideContent] = useState<{ title: string; markdown: string } | null>(null)
   const [isGeneratingGuide, setIsGeneratingGuide] = useState(false)
+  const [credits, setCredits] = useState<{ balanceCents: number; balanceDollars: string } | null>(null)
+  const [txHistory, setTxHistory] = useState<any[]>([])
+  const [useCreditsFirst, setUseCreditsFirst] = useState(true)
+  const [showHistoryModal, setShowHistoryModal] = useState(false)
+  const [depositAmount, setDepositAmount] = useState('5.00')
+  const [isDepositing, setIsDepositing] = useState(false)
+  const [depositStatus, setDepositStatus] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
-  const embeddedWallet = wallets.find((w) => w.walletClientType === 'privy')
+  const { sendTransaction } = usePrivy()
+
+  const embeddedWallet = wallets.find((w: any) => w.walletClientType === 'privy')
 
   const copyWalletAddress = async () => {
     if (!embeddedWallet?.address) return
@@ -56,24 +65,36 @@ export default function Home() {
     setTimeout(() => setCopied(false), 2000)
   }
 
-  const fetchBalances = useCallback(async () => {
+  const fetchBalancesAndCredits = useCallback(async () => {
     if (!embeddedWallet?.address) return
     try {
       const bal = await getBalances(embeddedWallet.address)
       setBalances(bal)
+
+      const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001'
+      
+      const creditsRes = await fetch(`${API_URL}/api/wallet/credits/${embeddedWallet.address}`)
+      if (creditsRes.ok) {
+        setCredits(await creditsRes.json())
+      }
+
+      const historyRes = await fetch(`${API_URL}/api/wallet/history/${embeddedWallet.address}`)
+      if (historyRes.ok) {
+        setTxHistory(await historyRes.json())
+      }
     } catch (error) {
-      console.error('Failed to fetch balances:', error)
+      console.error('Failed to fetch balances or credits:', error)
     }
   }, [embeddedWallet?.address])
 
   useEffect(() => {
     if (embeddedWallet?.address) {
-      fetchBalances()
+      fetchBalancesAndCredits()
       // Refresh balances every 30 seconds
-      const interval = setInterval(fetchBalances, 30000)
+      const interval = setInterval(fetchBalancesAndCredits, 30000)
       return () => clearInterval(interval)
     }
-  }, [embeddedWallet?.address, fetchBalances])
+  }, [embeddedWallet?.address, fetchBalancesAndCredits])
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -138,30 +159,15 @@ export default function Home() {
       // Store proof in MongoDB Atlas (always try to store, even if verification fails for now)
       try {
         console.log('Attempting to store proof in MongoDB...')
-        const response = await fetch('http://localhost:3001/zkid/proofs', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            walletAddress: proof.walletAddress,
-            domain: proof.domain,
-            method: proof.method,
-            generatedAt: proof.generatedAt,
-            proof: proof.proof,
-            publicSignals: proof.publicSignals,
-          }),
+        const result = await storeZkProof({
+          walletAddress: proof.walletAddress,
+          domain: proof.domain,
+          method: proof.method,
+          generatedAt: proof.generatedAt,
+          proof: proof.proof,
+          publicSignals: proof.publicSignals,
         })
-
-        console.log('Response status:', response.status, response.statusText)
-
-        if (response.ok) {
-          const result = await response.json()
-          console.log('✅ Proof stored in MongoDB:', result)
-        } else {
-          const error = await response.json().catch(() => ({ error: 'Unknown error' }))
-          console.error('❌ Failed to store proof:', response.status, error)
-        }
+        console.log('✅ Proof stored in MongoDB:', result)
       } catch (storageError) {
         console.error('❌ Error storing proof to MongoDB:', storageError)
         // Don't fail the whole flow if storage fails
@@ -272,65 +278,126 @@ export default function Home() {
     }
   }
 
+  const handleDeposit = async () => {
+    if (!embeddedWallet || !depositAmount) return;
+    setIsDepositing(true);
+    setDepositStatus('Fetching deposit address...');
+    
+    try {
+      const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+      
+      // 1. Get Deposit Address from Backend
+      const payToRes = await fetch(`${API_URL}/api/wallet/pay-to`);
+      const { address: payToAddress } = await payToRes.json();
+      
+      if (!payToAddress) throw new Error("Could not fetch deposit address");
+
+      setDepositStatus('Please sign the transaction in your wallet...');
+
+      // 2. Send USDC transaction using Privy
+      const amountNum = parseFloat(depositAmount);
+      if (isNaN(amountNum) || amountNum <= 0) throw new Error("Invalid amount");
+      
+      const amountCents = Math.floor(amountNum * 100);
+      const amountWei = BigInt(amountNum * 1e6); // USDC is 6 decimals
+      
+      // Standard ERC20 Transfer ABI signature data for transfer(address,uint256)
+      // We manually construct the calldata for the USDC contract
+      const transferSelector = '0xa9059cbb'; // keccak256('transfer(address,uint256)').slice(0, 10)
+      const paddedAddress = payToAddress.replace('0x', '').padStart(64, '0');
+      const paddedAmount = amountWei.toString(16).padStart(64, '0');
+      const data = `${transferSelector}${paddedAddress}${paddedAmount}`;
+
+      // USDC Contract on Base Sepolia
+      const USDC_ADDRESS = '0x036CbD53842c5426634e7929541eC2318f3dCF7e';
+
+      const txReq = {
+        to: USDC_ADDRESS,
+        chainId: 84532,
+        data: data
+      };
+
+      const txReceipt = await sendTransaction(txReq);
+      
+      setDepositStatus('Transaction submitted! Minting credits...');
+      
+      // 3. Inform Backend to Mint
+      const fundRes = await fetch(`${API_URL}/api/wallet/fund`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          walletAddress: embeddedWallet.address,
+          amountCents,
+          txHash: (txReceipt as any).transactionHash || txReceipt.hash
+        })
+      });
+
+      if (fundRes.ok) {
+        setDepositStatus('Credits added successfully!');
+        fetchBalancesAndCredits();
+        setTimeout(() => {
+          setShowFundModal(false);
+          setDepositStatus('');
+          setDepositAmount('5.00');
+        }, 2000);
+      } else {
+        const err = await fundRes.json();
+        throw new Error(err.error || 'Failed to mint credits');
+      }
+
+    } catch (error: any) {
+      console.error('Deposit Error:', error);
+      setDepositStatus(`Failed: ${error.message || 'Unknown error'}`);
+    } finally {
+      setIsDepositing(false);
+    }
+  }
+
   const handlePay = async (messageIndex: number) => {
     if (!embeddedWallet || !currentPrice || !zkProof) return
 
     setIsLoading(true)
     try {
-      // Use x402 payment flow with Privy wallet
-      const result = await makePaymentRequest(embeddedWallet, zkProof.domain)
+      const fetchWithPayment = await createX402Fetch(embeddedWallet)
+      const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001'
+      
+      const response = await fetchWithPayment(`${API_URL}/unlock`, {
+         method: 'POST',
+         headers: {
+           'Content-Type': 'application/json',
+           'X-Wallet-Address': embeddedWallet.address,
+           'X-Domain': zkProof.domain
+         },
+         body: JSON.stringify({ 
+           walletAddress: embeddedWallet.address,
+           domain: zkProof.domain,
+           useCreditsFirst
+         })
+      })
 
-      if (result.success && result.data) {
-        const responseData = result.data as {
-          data?: { timestamp?: string }
-          message?: string
-          settlement?: Settlement
-        }
-
-        console.log('[Payment] Settlement response:', responseData.settlement)
-
-        // Update message to show payment success
+      const result = await response.json()
+      
+      if (response.ok && result.success) {
         setMessages((prev) => prev.map((msg, i) =>
-          i === messageIndex
-            ? {
-                ...msg,
-                unlocked: true,
-                settlement: responseData.settlement
-              }
-            : msg
+          i === messageIndex ? { ...msg, unlocked: true, settlement: result.settlement } : msg
         ))
         setCurrentPrice(null)
+        fetchBalancesAndCredits()
 
-        // Refresh balances after successful payment
-        fetchBalances()
-
-        // Now generate the guide
         setIsGeneratingGuide(true)
-        try {
-          console.log('[Guide] Starting guide generation...')
-          const guideResult = await unlockData(embeddedWallet.address)
-          console.log('[Guide] Result:', guideResult)
-          if (guideResult.success && guideResult.markdown) {
-            setGuideContent({
-              title: guideResult.title || 'Your Guide',
-              markdown: guideResult.markdown
-            })
-            setShowGuideModal(true)
-          } else {
-            console.error('[Guide] Generation failed:', guideResult.error || 'No markdown returned')
-          }
-        } catch (guideError) {
-          console.error('[Guide] Exception:', guideError)
-        } finally {
-          setIsGeneratingGuide(false)
+        if (result.markdown) {
+           setGuideContent({
+             title: result.title || 'Your Guide',
+             markdown: result.markdown
+           })
+           setShowGuideModal(true)
         }
+        setIsGeneratingGuide(false)
       } else {
-        console.error('Payment failed:', result.error)
-        // Show error to user
         setMessages((prev) => prev.map((msg, i) =>
-          i === messageIndex
-            ? { ...msg, content: msg.content + `\n\nPayment error: ${result.error}` }
-            : msg
+          i === messageIndex ? { ...msg, content: msg.content + `\n\nPayment error: ${result.error || 'Failed'}` } : msg
         ))
       }
     } catch (error) {
@@ -474,7 +541,7 @@ export default function Home() {
         <div className="balance-card">
           <div className="balance-header">
             <span className="balance-label">Balance</span>
-            <button className="refresh-btn" onClick={fetchBalances} title="Refresh">
+            <button className="refresh-btn" onClick={fetchBalancesAndCredits} title="Refresh">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="M23 4v6h-6M1 20v-6h6" />
                 <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
@@ -495,7 +562,46 @@ export default function Home() {
           ) : (
             <div className="balance-loading">Loading...</div>
           )}
-          <button className="add-funds-btn" onClick={() => setShowFundModal(true)}>
+          <div className="about-divider" style={{ margin: '12px 0', opacity: 0.1 }} />
+          <div className="balance-header">
+            <span className="balance-label">System Credits</span>
+            <button className="refresh-btn" onClick={() => setShowHistoryModal(true)} title="History">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <circle cx="12" cy="12" r="10" />
+                <polyline points="12 6 12 12 16 14" />
+              </svg>
+            </button>
+          </div>
+          {credits ? (
+             <div className="balance-amounts">
+               <div className="balance-row">
+                 <span className="balance-token">Credits</span>
+                 <span className="balance-value">${credits.balanceDollars}</span>
+               </div>
+             </div>
+          ) : (
+            <div className="balance-loading">Loading...</div>
+          )}
+          
+          <div className="toggle-row" style={{ marginTop: '12px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '13px' }}>
+            <span style={{ color: 'var(--text-secondary)' }}>Use Credits First</span>
+            <label className="switch" style={{ position: 'relative', display: 'inline-block', width: '34px', height: '20px' }}>
+              <input type="checkbox" checked={useCreditsFirst} onChange={e => setUseCreditsFirst(e.target.checked)} style={{ opacity: 0, width: 0, height: 0 }} />
+              <span className="slider round" style={{ 
+                position: 'absolute', cursor: 'pointer', top: 0, left: 0, right: 0, bottom: 0, 
+                backgroundColor: useCreditsFirst ? 'var(--primary)' : 'var(--bg-tertiary)', 
+                transition: '.4s', borderRadius: '34px' 
+              }}>
+                <span style={{
+                  position: 'absolute', content: '""', height: '16px', width: '16px', left: '2px', bottom: '2px',
+                  backgroundColor: 'white', transition: '.4s', borderRadius: '50%',
+                  transform: useCreditsFirst ? 'translateX(14px)' : 'translateX(0)'
+                }} />
+              </span>
+            </label>
+          </div>
+
+          <button className="add-funds-btn" onClick={() => setShowFundModal(true)} style={{ marginTop: '12px' }}>
             Add Funds
           </button>
         </div>
@@ -692,59 +798,53 @@ export default function Home() {
             </div>
             <div className="modal-body">
               <p className="modal-description">
-                Get testnet tokens on Base Sepolia to use the x402 payment system.
+                Purchase system credits directly using USDC on Base Sepolia. Credits are instantly available for use inside x402.
               </p>
 
-              <div className="fund-option">
-                <div className="fund-option-header">
-                  <span className="fund-token">ETH</span>
-                  <span className="fund-network">Base Sepolia</span>
+              <div className="fund-option" style={{ display: 'flex', flexDirection: 'column', gap: '16px', background: 'var(--bg-secondary)', padding: '20px', borderRadius: '12px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <div style={{ background: '#2775ca', color: 'white', fontWeight: 600, fontSize: '10px', padding: '4px 8px', borderRadius: '12px' }}>USDC</div>
+                    <span style={{ fontWeight: 500, color: 'var(--text-primary)' }}>Deposit Amount</span>
+                  </div>
+                  <div className="chain-badge">Base Sepolia</div>
                 </div>
-                <p className="fund-option-desc">Required for gas fees</p>
-                <a
-                  href={FAUCETS.eth}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="fund-link-btn"
+
+                <div style={{ display: 'flex', alignItems: 'center', borderBottom: '1px solid var(--border-color)', paddingBottom: '8px' }}>
+                  <span style={{ fontSize: '24px', color: 'var(--text-secondary)', marginRight: '8px' }}>$</span>
+                  <input 
+                    type="number" 
+                    value={depositAmount} 
+                    onChange={e => setDepositAmount(e.target.value)}
+                    disabled={isDepositing}
+                    style={{ background: 'transparent', border: 'none', color: 'var(--text-primary)', fontSize: '24px', outline: 'none', width: '100%', fontWeight: 600 }}
+                  />
+                </div>
+
+                {depositStatus && <div style={{ fontSize: '12px', color: depositStatus.includes('Failed') ? 'red' : 'var(--primary)', fontWeight: 500 }}>{depositStatus}</div>}
+
+                <button 
+                  className="add-funds-btn" 
+                  onClick={handleDeposit}
+                  disabled={isDepositing}
+                  style={{ width: '100%', marginTop: '8px', opacity: isDepositing ? 0.7 : 1, cursor: isDepositing ? 'not-allowed' : 'pointer' }}
                 >
-                  Get ETH from Faucet
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-                    <polyline points="15 3 21 3 21 9" />
-                    <line x1="10" y1="14" x2="21" y2="3" />
-                  </svg>
-                </a>
+                  {isDepositing ? 'Processing via Privy...' : 'Send USDC & Mint Credits'}
+                </button>
               </div>
 
-              <div className="fund-option">
-                <div className="fund-option-header">
-                  <span className="fund-token">USDC</span>
-                  <span className="fund-network">Base Sepolia</span>
-                </div>
-                <p className="fund-option-desc">Required for x402 payments</p>
-                <a
-                  href={FAUCETS.usdc}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="fund-link-btn"
-                >
-                  Get USDC from Circle Faucet
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-                    <polyline points="15 3 21 3 21 9" />
-                    <line x1="10" y1="14" x2="21" y2="3" />
-                  </svg>
-                </a>
-              </div>
+              <div className="about-divider" style={{ margin: '24px 0', opacity: 0.1 }} />
+
+              <p className="modal-description" style={{ fontSize: '12px' }}>
+                Need test tokens? <a href={FAUCETS.usdc} target="_blank" rel="noreferrer" style={{ color: 'var(--primary)' }}>Get USDC Faucet</a> or <a href={FAUCETS.eth} target="_blank" rel="noreferrer" style={{ color: 'var(--primary)' }}>Get ETH Faucet</a>
+              </p>
 
               <div className="fund-wallet-info">
                 <span className="fund-wallet-label">Your wallet address:</span>
                 <code className="fund-wallet-address">{embeddedWallet?.address}</code>
                 <button className="copy-btn" onClick={copyWalletAddress}>
                   {copied ? (
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <polyline points="20 6 9 17 4 12" />
-                    </svg>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="20 6 9 17 4 12" /></svg>
                   ) : (
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
@@ -775,6 +875,46 @@ export default function Home() {
               <ReactMarkdown remarkPlugins={[remarkGfm]}>
                 {guideContent.markdown}
               </ReactMarkdown>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* History Modal */}
+      {showHistoryModal && (
+        <div className="modal-overlay" onClick={() => setShowHistoryModal(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Transaction History</h3>
+              <button className="modal-close" onClick={() => setShowHistoryModal(false)}>
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <line x1="18" y1="6" x2="6" y2="18" />
+                  <line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            </div>
+            <div className="modal-body" style={{ maxHeight: '400px', overflowY: 'auto' }}>
+              {txHistory.length === 0 ? (
+                <p className="modal-description">No recent transactions found.</p>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                  {txHistory.map((tx: any, i: number) => (
+                    <div key={tx.id || i} style={{ display: 'flex', justifyContent: 'space-between', padding: '12px', background: 'var(--bg-secondary)', borderRadius: '8px' }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                        <span style={{ fontWeight: 600, fontSize: '14px', color: 'var(--text-primary)' }}>{tx.type}</span>
+                        <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>{new Date(tx.createdAt).toLocaleString()}</span>
+                        {tx.txHash && <span style={{ fontSize: '11px', color: 'var(--primary)', fontFamily: 'monospace' }}>{tx.txHash.slice(0, 10)}...</span>}
+                      </div>
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', justifyContent: 'center' }}>
+                        <span style={{ fontWeight: 600, color: tx.amount < 0 ? 'var(--text-primary)' : '#4ade80' }}>
+                          {tx.amount > 0 ? '+' : ''}{(tx.amount / 100).toFixed(2)} USDC
+                        </span>
+                        <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>{tx.status}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         </div>
